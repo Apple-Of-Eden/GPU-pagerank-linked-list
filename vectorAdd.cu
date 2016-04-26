@@ -9,25 +9,12 @@
  *
  */
 
-/**
- * Vector addition: C = A + B.
- *
- * This sample is a very basic sample that implements element by element
- * vector addition. It is the same as the sample illustrating Chapter 2
- * of the programming guide with some additions like error checking.
- */
 
 #include <stdio.h>
 
 // For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_runtime.h>
 
-/**
- * CUDA Kernel Device code
- *
- * Computes the vector addition of A and B into C. The 3 vectors have the same
- * number of elements numElements.
- */
 __global__ void
 vectorAdd(const float *A, const float *B, float *C, int numElements)
 {
@@ -38,6 +25,7 @@ vectorAdd(const float *A, const float *B, float *C, int numElements)
         C[i] = A[i] + B[i];
     }
 }
+
 
 
 typedef struct vertex vertex;
@@ -57,59 +45,46 @@ float abs_float(float in) {
     return -in;
 }
 
-__global__ void testFunction(vertex * allVertices) {
-     printf("hi there: %d\n",allVertices[0].successors[0]->n_successors);
-     //printf("and here: %d\n",allVertices[0]);
+
+__global__ void setPagerankNextToZero(vertex * vertices) {
+    int i = threadIdx.x;
+    
+    vertices[i].pagerank_next = 0;
 }
 
-__global__ void calcPagerank(float ** matrix, float *pagerankMatrix){
+__global__ void initializePageranks(vertex * vertices, int n_vertices) {
+    int i = threadIdx.x;
+    
+    vertices[i].pagerank = 1.0/(float)n_vertices;
+}
+
+
+__global__ void addToNextPagerank(vertex * vertices, float * dangling_value) {
     int i = threadIdx.x;
     int j;
-    int q = 0;
-    float newPagerank = 0.0;    
-    
 
-    if(i ==0) {
-        printf("pagerank before: %.6f\n",pagerankMatrix[i]);
-    }
-
-    while(q < 23) {
-        newPagerank = 0.0;
-        for(j=0;j<46;j++) {
-            newPagerank = newPagerank+ (matrix[i][j] * pagerankMatrix[j]);
-         } 
-        __syncthreads(); 
-    
-        pagerankMatrix[i] = newPagerank; 
-        q++;
-     }
-    //printf("ci: %d, cpr: %.5f\n",i,pagerankMatrix[i]);
-    if(i ==0) {
-        printf("pagerank after: %.6f\n",pagerankMatrix[i]);
+    if(vertices[i].n_successors > 0) {
+        for(j = 0; j < vertices[i].n_successors; j++) {
+            atomicAdd(&(vertices[i].successors[j]->pagerank_next), 0.85*(vertices[i].pagerank)/vertices[i].n_successors);
+        }
+    }else {
+        atomicAdd(dangling_value, 0.85*vertices[i].pagerank);
     }
 }
 
-__global__ void distributeVotes(vertex * vertices) {
+__global__ void finalPagerankForIteration(vertex * vertices, int n_vertices, float dangling_value){
     int i = threadIdx.x;
-    int j;
-    float  value;
-    float alpha = 0.85;
-   // printf("threadIdx.x: %d\n", i);
-    __shared__ int count;
-    count = 0;
-    __syncthreads();
-     count++;
-    printf("count: %d\n",count);
-    if (vertices[i].n_successors){
-        value = (alpha/vertices[i].n_successors)*vertices[i].pagerank;  //value = vote value after splitting equally
-    } else {
-        value = 0;
-    }
+
+    vertices[i].pagerank_next += (dangling_value + (1-0.85))/((float)n_vertices);
     
-    for (j=0;j<vertices[i].n_successors;j++) {               // pagerank_next = sum of votes linking to it
-        vertices[i].successors[j]->pagerank_next += value;
-    }
 }
+
+__global__ void setPageranksFromNext(vertex * vertices) {
+    int i = threadIdx.x;
+
+    vertices[i].pagerank = vertices[i].pagerank_next;
+}
+
 
 int main(void) {
 // Error code to check return values for CUDA calls
@@ -125,7 +100,7 @@ int main(void) {
   vertex * vertices;
 
   FILE * fp;
-  if ((fp = fopen("testInput2.txt", "r")) == NULL) {
+  if ((fp = fopen("testInput.txt", "r")) == NULL) {
     fprintf(stderr,"ERROR: Could not open input file.\n");
     exit(-1);
   }
@@ -140,8 +115,8 @@ int main(void) {
       n_vertices = vertex_to;
   }
   n_vertices++;
-
-    // CALC NUMBER OF OUTGOING LINKS PER PAGE ***********************************
+    
+// CALC NUMBER OF OUTGOING LINKS PER PAGE ***********************************
     unsigned int * outgoingLinks = (unsigned int *) calloc(n_vertices,sizeof(unsigned int)); 
     fseek(fp,0L, SEEK_SET);
     while(fscanf(fp,"%u %u", &vertex_from, &vertex_to) != EOF) {
@@ -153,84 +128,11 @@ int main(void) {
   err = cudaMallocManaged((void **)&vertices, n_vertices*sizeof(vertex));
  // err = cudaMemcpy(d_vertices, vertices, sizeOfVertices, cudaMemcpyHostToDevice);
 
-    // CREATE MATRIX  **********************************************************
-    float ** matrix;
+    // SET Initial values  **********************************************************
     unsigned int n_iterations = 25;
     float alpha = 0.85;
     float eps   = 0.000001;
-
-   // matrix = (float **) malloc(n_vertices * sizeof(float*));
-    err = cudaMallocManaged((void***)&matrix,n_vertices*sizeof(float*));
-    for(i=0; i < n_vertices; i++) {
-       // matrix[i] = (float *) malloc(n_vertices * sizeof(float));
-        err = cudaMallocManaged((void**)&matrix[i],n_vertices*sizeof(float));
-     }
    
-    //CREATE PAGERANK MATRIX
-    float initialPageranks = 1.0/((float)n_vertices);
-    float * pagerankMatrix;
-    err = cudaMallocManaged((void**)&pagerankMatrix,n_vertices*sizeof(float));
-    
-    for(i=0;i<n_vertices;i++) {
-        pagerankMatrix[i] = initialPageranks;    
-        printf("i:%d pr:%.4f, ",i,pagerankMatrix[i]);
-    }
-    printf("\n\n");    
-    
-
-    // SET MATRIX INITIAL (ALPHA - 1) VALUE ******************************************
-    float danglingCorrection = 1.0/(float)n_vertices;
-    float initialVal = (1.0-alpha)/(float)n_vertices;
-
-    for(i=0;i < n_vertices; i++) {
-        for(j=0; j < n_vertices;j++) {
-            matrix[i][j] = initialVal;
-        }
-    }
-    
-    // FINISH MATRIX INITIAL VALUE SETUP **************************************** 
-    fseek(fp,0L, SEEK_SET);
-    unsigned int prev_page = 0;
-    while(fscanf(fp,"%u %u", &vertex_from, &vertex_to) != EOF) {
-        if(prev_page != vertex_from && vertex_from - prev_page > 1) {         // if there's a dangling node;
-            for(i=prev_page+1; i < vertex_from; i++) {
-                for(j=0;j < n_vertices; j++) {
-                    matrix[i][j] += alpha*danglingCorrection;
-                } 
-            }
-        }
-        matrix[vertex_to][vertex_from] += alpha/(float)outgoingLinks[vertex_from]; 
-
-        prev_page = vertex_from;
-    }    
-    // CONTROL ABOVE FOR CASES WHERE LAST NODES ARE SKIPPED
-    if(vertex_from != (n_vertices-1)) {               // If the last vertex doesn't equal the number of vertices 
-        for(i=vertex_from+1; i < n_vertices;i++) {    // Initialize all dangling nodes
-            for(j=0;j<n_vertices;j++) {
-                matrix[i][j] += alpha*danglingCorrection; 
-            }
-        }
-    }
-    
-    //PRINT MATRIX
-    for(i=0;i<n_vertices;i++) {
-        printf("%d\n",i);
-        for(j=0;j<n_vertices;j++) {
-            printf("%.6f, ",matrix[i][j]);
-        }
-        printf("\n\n");
-    }
-
-    //CALL CUDA CODE
-    calcPagerank<<<1,8>>>(matrix, pagerankMatrix);
-    cudaDeviceSynchronize();
-    
-    for(i=0;i<n_vertices;i++) {
-        printf("i: %d, pr: %.5f\n",i,pagerankMatrix[i]);
-    }
-    
-    
-/////////////////////END OF MY MATRIX TEST/////////////////////////////////////////////
 
  if (!vertices) {
     fprintf(stderr,"Malloc failed for vertices.\n");
@@ -292,7 +194,74 @@ int main(void) {
   /*************************************************************************/
   // compute the pagerank
 
-  
+    float dangling_value_h = 0;
+    float * dangling_value_d;
+    
+    err = cudaMalloc((void **)&dangling_value_d, sizeof(float));
+    err = cudaMemcpy(dangling_value_d, &dangling_value_h, sizeof(float), cudaMemcpyHostToDevice);
+    //err = cudaMallocManaged((void *)&dangling_value, sizeof(float));
+
+    initializePageranks<<<1,46>>>(vertices, n_vertices);
+   cudaDeviceSynchronize();
+    
+    for(i = 0; i < 23; i++) {
+        // set the next pagerank values to 0
+        setPagerankNextToZero<<<1,46>>>(vertices);
+        cudaDeviceSynchronize();
+       
+        // set the dangling value to 0 
+        dangling_value_h = 0;
+        err = cudaMemcpy(dangling_value_d, &dangling_value_h, sizeof(float), cudaMemcpyHostToDevice);
+        
+        // initial parallel pagerank_next computation
+        addToNextPagerank<<<1,46>>>(vertices, dangling_value_d);
+        cudaDeviceSynchronize();
+
+        // get the dangling value
+        err = cudaMemcpy(&dangling_value_h, dangling_value_d, sizeof(float), cudaMemcpyDeviceToHost);
+        printf("the dangling_value is now: %.3f\n",dangling_value_h);
+ 
+        // final parallel pagerank_next computation
+        finalPagerankForIteration<<<1,46>>>(vertices, n_vertices, dangling_value_h);
+         cudaDeviceSynchronize();
+
+        setPageranksFromNext<<<1,46>>>(vertices);
+        cudaDeviceSynchronize(); 
+    }
+
+ /*   float dangling_value = 0;
+    int q;
+
+    for (i=0; i < 23; i++) {
+        for(j=0; j < n_vertices; j++) {
+            vertices[j].pagerank_next = 0;
+        }
+
+        dangling_value = 0;
+
+        for(j=0; j < n_vertices; j++) {
+            if(vertices[j].successors > 0) {
+               for(q=0; q < vertices[j].successors; q++) {
+                    vertices[j].successors[q]->pagerank_next += (0.85*vertices[j].pagerank)/(float)vertices[j].successors; 
+                }        
+            } else {
+                dangling_value += 0.85 * vertices[j].pagerank;
+            }
+        }
+
+        for(j = 0; j < n_vertices; j++) {
+            vertices[j].pagerank_next = 
+        }
+
+    }*/
+
+
+    // print
+    for (i=0;i<n_vertices;i++) {
+        printf("AFTER GPU | Vertex %u:\tpagerank = %.6f\n", i, vertices[i].pagerank);
+    }
+
+ 
   // run on the host
   unsigned int i_iteration;
 
@@ -333,8 +302,10 @@ int main(void) {
     cudaMemcpy(d_testVar, vertices[0].successors, 3*sizeof(vertex*), cudaMemcpyHostToDevice);
     cudaMemcpy(&(d_vertices[0].successors),&d_testVar,sizeof(vertex**), cudaMemcpyHostToDevice);
     */
-    testFunction<<<1,1>>>(vertices);
-    cudaDeviceSynchronize();
+
+
+   // testFunction<<<1,1>>>(vertices);
+   // cudaDeviceSynchronize();
   //  printf("for comp: %p\n", vertices[0].successors);
 
 //********************************************************************************************* 
@@ -350,8 +321,6 @@ int main(void) {
             vertices[i].successors[j]->pagerank_next += value;
        }
      }
-   // distributeVotes<<<1,46>>>(vertices);
-   // cudaDeviceSynchronize();
     
     // for normalization
      pr_sum_inv = 1/pr_sum;
